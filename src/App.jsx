@@ -15,12 +15,11 @@ import {
   Search,
   Send,
   Settings,
-  Smile,
-  SkipForward,
   Users,
   Vote,
   Wifi,
-  WifiOff
+  WifiOff,
+  SkipForward
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
 
@@ -91,20 +90,16 @@ function getUserId() {
 }
 
 function getUsername() {
-  const key = "watch-party-username";
-  return localStorage.getItem(key) || "";
+  return localStorage.getItem("watch-party-username") || "";
 }
 
 function makeRoomCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase();
 }
 
 function formatTime(seconds = 0) {
-  const safe = Math.max(0, Math.floor(seconds || 0));
-  const minutes = Math.floor(safe / 60);
-  const remaining = safe % 60;
-
-  return `${minutes}:${String(remaining).padStart(2, "0")}`;
+  const safe = Math.max(0, Math.floor(Number(seconds) || 0));
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
 }
 
 function expectedPosition(room) {
@@ -118,15 +113,14 @@ function expectedPosition(room) {
     room.playback_updated_at || Date.now()
   ).getTime();
 
-  const elapsed = Math.max(0, (Date.now() - updatedAt) / 1000);
-
-  return start + elapsed;
+  return start + Math.max(0, (Date.now() - updatedAt) / 1000);
 }
 
 export default function App() {
   const userId = useMemo(() => getUserId(), []);
-  const [username, setUsername] = useState(getUsername());
-  const [nameInput, setNameInput] = useState(getUsername());
+
+  const [username, setUsername] = useState(getUsername);
+  const [nameInput, setNameInput] = useState(getUsername);
   const [roomCodeInput, setRoomCodeInput] = useState("");
   const [room, setRoom] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -143,11 +137,14 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [activeTab, setActiveTab] = useState("chat");
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
 
   const videoRef = useRef(null);
   const channelRef = useRef(null);
   const roomRef = useRef(null);
   const correctionRef = useRef(false);
+  const noticeTimerRef = useRef(null);
 
   const isHost = room?.host_id === userId;
 
@@ -171,9 +168,14 @@ export default function App() {
     roomRef.current = room;
   }, [room]);
 
+  useEffect(() => {
+    return () => window.clearTimeout(noticeTimerRef.current);
+  }, []);
+
   const showNotice = useCallback((message) => {
     setNotice(message);
-    window.setTimeout(() => setNotice(""), 3500);
+    window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setNotice(""), 3500);
   }, []);
 
   const saveUsername = () => {
@@ -188,25 +190,10 @@ export default function App() {
     setUsername(clean);
   };
 
-  const refreshRoom = useCallback(async (code) => {
-    if (!supabase) return null;
-
-    const { data, error } = await supabase
-      .from("rooms")
-      .select("*")
-      .eq("code", code)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (data) setRoom(data);
-
-    return data;
-  }, []);
-
   const enterRoom = useCallback(
     async (code) => {
       if (!supabase) {
-        showNotice("Connect Supabase before creating or joining rooms.");
+        showNotice("Configure Supabase before joining a room.");
         return;
       }
 
@@ -215,11 +202,16 @@ export default function App() {
         return;
       }
 
+      const cleanCode = code.trim().toUpperCase();
+
+      if (!cleanCode) {
+        showNotice("Enter a room code.");
+        return;
+      }
+
       setLoading(true);
 
       try {
-        const cleanCode = code.trim().toUpperCase();
-
         const { data, error } = await supabase
           .from("rooms")
           .select("*")
@@ -254,7 +246,7 @@ export default function App() {
 
   const createRoom = async () => {
     if (!supabase) {
-      showNotice("Connect Supabase before creating a room.");
+      showNotice("Configure Supabase before creating a room.");
       return;
     }
 
@@ -268,7 +260,7 @@ export default function App() {
     try {
       let created = null;
 
-      for (let attempt = 0; attempt < 3 && !created; attempt++) {
+      for (let attempt = 0; attempt < 5 && !created; attempt++) {
         const code = makeRoomCode();
 
         const { data, error } = await supabase
@@ -294,7 +286,9 @@ export default function App() {
         }
       }
 
-      if (!created) throw new Error("Could not generate a unique room code.");
+      if (!created) {
+        throw new Error("Could not create a unique room. Please try again.");
+      }
 
       setRoom(created);
       setPlaylist([]);
@@ -313,23 +307,21 @@ export default function App() {
     }
   };
 
-  // Automatically rejoin the room if its code is in the URL.
+  // Restore a room from the URL when the page is refreshed.
   useEffect(() => {
     const code = new URLSearchParams(window.location.search).get("room");
 
     if (code && username && supabase) {
       enterRoom(code);
     }
-    // Initial URL restoration only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [username, enterRoom]);
 
-  // Subscribe to room changes, messages, and online participants.
+  // Subscribe to shared room changes, messages, reactions and presence.
   useEffect(() => {
     if (!room?.code || !supabase) return;
 
-    const code = room.code;
     let active = true;
+    const code = room.code;
 
     const channel = supabase
       .channel(`watch-party-${code}`, {
@@ -397,8 +389,7 @@ export default function App() {
           .flat()
           .map((entry) => ({
             id: entry.user_id,
-            username: entry.username,
-            isHost: entry.user_id === roomRef.current?.host_id
+            username: entry.username
           }));
 
         setParticipants(people);
@@ -420,26 +411,33 @@ export default function App() {
     channelRef.current = channel;
 
     const loadInitialData = async () => {
-      const { data: currentRoom } = await supabase
+      const { data: currentRoom, error } = await supabase
         .from("rooms")
         .select("*")
         .eq("code", code)
         .maybeSingle();
 
-      if (!active || !currentRoom) return;
+      if (!active) return;
+      if (error) {
+        showNotice("Unable to refresh room state.");
+        return;
+      }
+      if (!currentRoom) return;
 
       setRoom(currentRoom);
       setPlaylist(currentRoom.playlist || []);
       setPolls(currentRoom.polls || []);
 
-      const { data: existingMessages } = await supabase
+      const { data: existingMessages, error: messagesError } = await supabase
         .from("messages")
         .select("*")
         .eq("room_code", code)
         .order("created_at", { ascending: true })
         .limit(200);
 
-      if (active && existingMessages) setMessages(existingMessages);
+      if (active && !messagesError && existingMessages) {
+        setMessages(existingMessages);
+      }
     };
 
     loadInitialData();
@@ -451,50 +449,47 @@ export default function App() {
       setConnected(false);
       setParticipants([]);
     };
-  }, [room?.code, userId, username]);
+  }, [room?.code, userId, username, showNotice]);
 
-  // Correct playback drift using the shared playback timestamp.
+  // Synchronize the video with the shared room state.
   useEffect(() => {
-    if (!room || !videoRef.current) return;
-
     const video = videoRef.current;
+
+    if (!room || !video) return;
+
     const target = expectedPosition(room);
 
-    const applyPlayback = async () => {
-      if (!Number.isFinite(target)) return;
+    if (Number.isFinite(target) && Math.abs(video.currentTime - target) > 0.5) {
+      correctionRef.current = true;
+      video.currentTime = target;
 
-      const differs = Math.abs(video.currentTime - target);
+      window.setTimeout(() => {
+        correctionRef.current = false;
+      }, 300);
+    }
 
-      if (differs > 0.5 && !correctionRef.current) {
-        correctionRef.current = true;
-        video.currentTime = target;
-        window.setTimeout(() => {
-          correctionRef.current = false;
-        }, 300);
-      }
+    if (room.is_playing && video.paused) {
+      video.play().catch(() => {
+        showNotice("Press play on the video if your browser blocks autoplay.");
+      });
+    } else if (!room.is_playing && !video.paused) {
+      video.pause();
+    }
+  }, [room, showNotice]);
 
-      if (room.is_playing && video.paused) {
-        try {
-          await video.play();
-        } catch {
-          // Browsers can require a user gesture before playback.
-        }
-      } else if (!room.is_playing && !video.paused) {
-        video.pause();
-      }
-    };
-
-    applyPlayback();
-  }, [room]);
-
+  // Periodically correct playback drift and refresh the displayed clock.
   useEffect(() => {
-    if (!room?.is_playing) return;
+    if (!room) return;
 
     const interval = window.setInterval(() => {
       const video = videoRef.current;
       const currentRoom = roomRef.current;
 
-      if (!video || !currentRoom?.is_playing || video.paused) return;
+      if (!video || !currentRoom) return;
+
+      setCurrentTime(video.currentTime || 0);
+
+      if (!currentRoom.is_playing || video.paused) return;
 
       const target = expectedPosition(currentRoom);
 
@@ -509,10 +504,10 @@ export default function App() {
           correctionRef.current = false;
         }, 300);
       }
-    }, 1500);
+    }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [room?.is_playing, room?.code]);
+  }, [room?.code]);
 
   const updatePlayback = async (playing, position) => {
     if (!room || !supabase) return;
@@ -539,9 +534,10 @@ export default function App() {
     if (!room) return;
 
     const video = videoRef.current;
-    const position = video?.currentTime ?? expectedPosition(room);
-
-    await updatePlayback(!room.is_playing, position);
+    await updatePlayback(
+      !room.is_playing,
+      video?.currentTime ?? expectedPosition(room)
+    );
   };
 
   const seekVideo = async (event) => {
@@ -549,6 +545,7 @@ export default function App() {
 
     const position = Number(event.target.value);
     videoRef.current.currentTime = position;
+    setCurrentTime(position);
 
     await updatePlayback(room.is_playing, position);
   };
@@ -557,7 +554,6 @@ export default function App() {
     event.preventDefault();
 
     const content = chatInput.trim();
-
     if (!content || !room || !supabase) return;
 
     setChatInput("");
@@ -582,20 +578,37 @@ export default function App() {
     });
   };
 
-  const saveRoomData = async (changes) => {
-    if (!room || !supabase || !isHost) return;
+  // Host-only updates are the default.
+  // Poll voting passes false, allowing prototype voting by participants.
+  const saveRoomData = async (changes, hostOnly = true) => {
+    if (!room || !supabase) return;
 
-    const { error } = await supabase
+    if (hostOnly && !isHost) {
+      showNotice("Only the host can make this change.");
+      return;
+    }
+
+    let query = supabase
       .from("rooms")
       .update(changes)
-      .eq("code", room.code)
-      .eq("host_id", userId);
+      .eq("code", room.code);
+
+    if (hostOnly) {
+      query = query.eq("host_id", userId);
+    }
+
+    const { error } = await query;
 
     if (error) showNotice(error.message);
   };
 
   const addToPlaylist = async (movie) => {
     if (!room) return;
+
+    if (!isHost) {
+      showNotice("Only the host can edit the shared playlist.");
+      return;
+    }
 
     if (playlist.some((item) => item.id === movie.id)) {
       showNotice("That movie is already in the playlist.");
@@ -627,6 +640,8 @@ export default function App() {
   const createPoll = async (event) => {
     event.preventDefault();
 
+    if (!isHost) return;
+
     const question = pollQuestion.trim();
     const options = pollOptions
       .split(",")
@@ -635,7 +650,7 @@ export default function App() {
       .slice(0, 6);
 
     if (!question || options.length < 2) {
-      showNotice("Add a question and at least two comma-separated options.");
+      showNotice("Enter a question and at least two options.");
       return;
     }
 
@@ -673,25 +688,24 @@ export default function App() {
     });
 
     setPolls(next);
-    await saveRoomData({ polls: next });
+    await saveRoomData({ polls: next }, false);
   };
 
   const transferHost = async (person) => {
     if (!isHost || !person || person.id === userId) return;
 
-    const confirmed = window.confirm(
-      `Transfer host control to ${person.username}?`
-    );
-
-    if (!confirmed) return;
+    if (!window.confirm(`Transfer host control to ${person.username}?`)) {
+      return;
+    }
 
     await saveRoomData({ host_id: person.id });
-    showNotice("Host transfer requested.");
+    showNotice("Host transfer submitted.");
   };
 
   const leaveRoom = () => {
     if (channelRef.current && supabase) {
       supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
     }
 
     setRoom(null);
@@ -699,26 +713,34 @@ export default function App() {
     setParticipants([]);
     setPlaylist([]);
     setPolls([]);
+    setConnected(false);
+
     window.history.replaceState({}, "", window.location.pathname);
   };
 
   const copyInvite = async () => {
-    const link = `${window.location.origin}${window.location.pathname}?room=${room.code}`;
+    const link =
+      `${window.location.origin}${window.location.pathname}?room=${room.code}`;
 
     try {
       await navigator.clipboard.writeText(link);
       showNotice("Invite link copied.");
     } catch {
-      showNotice(`Share room code: ${room.code}`);
+      showNotice(`Share this room code: ${room.code}`);
     }
   };
-
-  const activePolls = polls || [];
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <a className="brand" href="#" onClick={leaveRoom}>
+        <a
+          className="brand"
+          href="#"
+          onClick={(event) => {
+            event.preventDefault();
+            leaveRoom();
+          }}
+        >
           <span className="brand-icon"><Film size={22} /></span>
           <span>watch<span className="accent">party</span></span>
         </a>
@@ -730,14 +752,16 @@ export default function App() {
               {connected ? "Connected" : "Connecting"}
             </span>
           )}
-          <span className="avatar">{username ? username[0].toUpperCase() : "?"}</span>
+          <span className="avatar">
+            {username ? username[0].toUpperCase() : "?"}
+          </span>
         </div>
       </header>
 
       {!username ? (
         <main className="welcome-page">
           <div className="hero-badge"><span /> YOUR MOVIE NIGHT STARTS HERE</div>
-          <h1>Movies are better<br /> <span>together.</span></h1>
+          <h1>Movies are better<br /><span>together.</span></h1>
           <p className="hero-description">
             Watch in sync, share reactions, discover something new,
             and make every movie night a group experience.
@@ -761,7 +785,7 @@ export default function App() {
       ) : !room ? (
         <main className="welcome-page">
           <div className="hero-badge"><span /> YOUR PRIVATE MOVIE LOUNGE</div>
-          <h1>Movies are better<br /> <span>together.</span></h1>
+          <h1>Movies are better<br /><span>together.</span></h1>
           <p className="hero-description">
             Create a room for friends or enter a room code to join a watch party.
           </p>
@@ -769,20 +793,21 @@ export default function App() {
           {!supabase && (
             <div className="notice warning">
               <Settings size={18} />
-              Supabase is not configured yet. Your interface is ready,
-              but shared rooms need the backend connection.
+              Supabase is not configured yet. Shared rooms require a backend connection.
             </div>
           )}
 
           <section className="setup-card">
             <h2>Create a watch party</h2>
             <p>Start a room and invite your friends with a link.</p>
+
             <button
               className="primary-button full-button"
               onClick={createRoom}
               disabled={loading || !supabase}
             >
-              <Plus size={18} /> {loading ? "Creating..." : "Create a room"}
+              <Plus size={18} />
+              {loading ? "Creating..." : "Create a room"}
             </button>
 
             <div className="separator"><span>OR JOIN YOUR FRIENDS</span></div>
@@ -792,7 +817,9 @@ export default function App() {
               <input
                 id="room-code"
                 value={roomCodeInput}
-                onChange={(event) => setRoomCodeInput(event.target.value.toUpperCase())}
+                onChange={(event) =>
+                  setRoomCodeInput(event.target.value.toUpperCase())
+                }
                 placeholder="E.G. A1B2C3"
                 maxLength={6}
               />
@@ -818,7 +845,10 @@ export default function App() {
             <div>
               <div className="eyebrow">YOUR WATCH ROOM</div>
               <h1>{room.video_title}</h1>
-              <p>Room <strong>{room.code}</strong> · {isHost ? "You're the host" : "You're watching together"}</p>
+              <p>
+                Room <strong>{room.code}</strong> ·{" "}
+                {isHost ? "You're the host" : "You're watching together"}
+              </p>
             </div>
 
             <div className="room-actions">
@@ -847,9 +877,16 @@ export default function App() {
                     src={room.video_url || SAMPLE_VIDEO}
                     controls={false}
                     playsInline
+                    onTimeUpdate={(event) =>
+                      setCurrentTime(event.currentTarget.currentTime)
+                    }
+                    onLoadedMetadata={(event) =>
+                      setDuration(event.currentTarget.duration || 0)
+                    }
                     onEnded={() => updatePlayback(false, 0)}
                     onError={() => showNotice("Video unavailable. Try another video URL.")}
                   />
+
                   {reactions.length > 0 && (
                     <div className="floating-reactions" aria-live="polite">
                       {reactions.slice(-6).map((reaction) => (
@@ -870,34 +907,27 @@ export default function App() {
                     {room.is_playing ? <Pause size={21} /> : <Play size={21} />}
                   </button>
 
-                  <span className="time-label">
-                    {formatTime(videoRef.current?.currentTime ?? expectedPosition(room))}
-                  </span>
+                  <span className="time-label">{formatTime(currentTime)}</span>
 
                   <input
                     className="seek-slider"
                     type="range"
                     min="0"
-                    max={Math.max(videoRef.current?.duration || 60, 1)}
+                    max={Math.max(duration, 1)}
                     step="0.5"
-                    value={Math.min(
-                      videoRef.current?.currentTime ?? expectedPosition(room),
-                      videoRef.current?.duration || 60
-                    )}
+                    value={Math.min(currentTime, duration || 0)}
                     onChange={seekVideo}
                     disabled={!isHost}
                     aria-label="Seek video"
                   />
 
-                  <span className="time-label">
-                    {formatTime(videoRef.current?.duration || 0)}
-                  </span>
+                  <span className="time-label">{formatTime(duration)}</span>
                 </div>
 
                 <div className="sync-status">
                   <span className="sync-dot" />
                   {connected ? "Room connected" : "Reconnecting to room"}
-                  <span className="sync-note">Sync correction enabled</span>
+                  <span className="sync-note">Drift correction enabled</span>
                 </div>
               </div>
 
@@ -938,9 +968,11 @@ export default function App() {
                         <Clapperboard size={34} />
                         <span>{movie.genre}</span>
                       </div>
+
                       <div className="movie-card-body">
                         <h3>{movie.title}</h3>
                         <p>{movie.year} · {movie.genre}</p>
+
                         <div className="movie-card-actions">
                           <button
                             className="small-button"
@@ -948,6 +980,7 @@ export default function App() {
                           >
                             <Plus size={15} /> Playlist
                           </button>
+
                           <button
                             className="small-button play-small"
                             onClick={() => playFromPlaylist(movie)}
@@ -962,7 +995,7 @@ export default function App() {
                 </div>
 
                 <p className="demo-note">
-                  Demo catalog: titles and artwork are placeholders. The sample
+                  Demo catalog: titles and artwork are placeholders. Sample
                   selections currently use the same public test video.
                 </p>
               </section>
@@ -981,13 +1014,16 @@ export default function App() {
                     <span className="avatar small-avatar">
                       {(person.username || "?")[0].toUpperCase()}
                     </span>
+
                     <div className="participant-name">
                       <strong>{person.username}</strong>
                       {person.id === userId && <span>You</span>}
                     </div>
+
                     {person.id === room.host_id && (
                       <span className="host-tag">HOST</span>
                     )}
+
                     {isHost && person.id !== userId && (
                       <button
                         className="icon-button"
@@ -1013,12 +1049,14 @@ export default function App() {
                   >
                     <MessageCircle size={16} /> Chat
                   </button>
+
                   <button
                     className={activeTab === "playlist" ? "active" : ""}
                     onClick={() => setActiveTab("playlist")}
                   >
                     <Film size={16} /> Queue
                   </button>
+
                   <button
                     className={activeTab === "polls" ? "active" : ""}
                     onClick={() => setActiveTab("polls")}
@@ -1035,6 +1073,7 @@ export default function App() {
                           <span className="chat-avatar">
                             {(message.username || "?")[0].toUpperCase()}
                           </span>
+
                           <div>
                             <div className="chat-meta">
                               <strong>{message.username}</strong>
@@ -1049,6 +1088,7 @@ export default function App() {
                           </div>
                         </div>
                       ))}
+
                       {messages.length === 0 && (
                         <div className="empty-state">
                           <MessageCircle size={24} />
@@ -1094,10 +1134,12 @@ export default function App() {
                     {playlist.map((movie, index) => (
                       <div className="queue-item" key={movie.id}>
                         <span className="queue-number">{index + 1}</span>
+
                         <div className="queue-item-info">
                           <strong>{movie.title}</strong>
                           <span>{movie.genre}</span>
                         </div>
+
                         <button
                           className="icon-button"
                           onClick={() => playFromPlaylist(movie)}
@@ -1121,35 +1163,43 @@ export default function App() {
 
                 {activeTab === "polls" && (
                   <div className="polls-content">
-                    {activePolls.map((poll) => (
-                      <div className="poll-card" key={poll.id}>
-                        <h3>{poll.question}</h3>
-                        {poll.options.map((option, index) => {
-                          const votes = option.votes || [];
-                          const total = poll.options.reduce(
-                            (sum, item) => sum + (item.votes || []).length,
-                            0
-                          );
+                    {polls.map((poll) => {
+                      const total = poll.options.reduce(
+                        (sum, option) => sum + (option.votes || []).length,
+                        0
+                      );
 
-                          return (
-                            <button
-                              className="poll-option"
-                              key={option.label}
-                              onClick={() => votePoll(poll.id, index)}
-                            >
-                              <span>{option.label}</span>
-                              <span>
-                                {votes.length} · {total
-                                  ? Math.round((votes.length / total) * 100)
-                                  : 0}%
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ))}
+                      return (
+                        <div className="poll-card" key={poll.id}>
+                          <h3>{poll.question}</h3>
 
-                    {activePolls.length === 0 && (
+                          {poll.options.map((option, index) => {
+                            const votes = option.votes || [];
+                            const hasVoted = votes.includes(userId);
+
+                            return (
+                              <button
+                                className="poll-option"
+                                key={option.label}
+                                onClick={() => votePoll(poll.id, index)}
+                              >
+                                <span>
+                                  {option.label}{hasVoted ? " ✓" : ""}
+                                </span>
+                                <span>
+                                  {votes.length} ·{" "}
+                                  {total
+                                    ? Math.round((votes.length / total) * 100)
+                                    : 0}%
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+
+                    {polls.length === 0 && (
                       <div className="empty-state">
                         <Vote size={24} />
                         <p>No group polls yet.</p>
@@ -1165,12 +1215,14 @@ export default function App() {
                           placeholder="What should we watch?"
                           maxLength={150}
                         />
+
                         <label>Options, separated by commas</label>
                         <input
                           value={pollOptions}
                           onChange={(event) => setPollOptions(event.target.value)}
                           placeholder="Comedy, Thriller, Drama"
                         />
+
                         <button className="primary-button full-button" type="submit">
                           <Plus size={16} /> Create poll
                         </button>
@@ -1185,6 +1237,7 @@ export default function App() {
                   <CircleHelp size={18} />
                   <h2>Room details</h2>
                 </div>
+
                 <div className="detail-row">
                   <span>Room code</span>
                   <strong>{room.code}</strong>
